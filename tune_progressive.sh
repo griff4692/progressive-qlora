@@ -10,6 +10,7 @@ VAL_NUM=512
 MAX_MEMORY=49000
 EVAL_STEPS=500
 MAX_STEPS=10000
+MAX_EVAL_SAMPLES=512
 
 if [[ $MODEL_SIZE -eq 7 ]]; then
   echo "Detected 7B"
@@ -27,6 +28,7 @@ python qlora.py \
   --dataset_format self-instruct \
   --dataset griffin/progressive_summarization \
   --run_name $EXPERIMENT \
+  --max_eval_samples $MAX_EVAL_SAMPLES \
   --model_name_or_path "tiiuae/falcon-${MODEL_SIZE}b" \
   --learning_rate $LEARNING_RATE \
   --eval_dataset_size $VAL_NUM \

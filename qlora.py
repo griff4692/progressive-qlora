@@ -576,24 +576,21 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
 
      # Load dataset.
     dataset = load_data(args.dataset)
+    
+    ids = list(set(dataset['train']['id']))
+    import numpy as np
+    np.random.seed(1992)
+    np.random.shuffle(ids)
+    val_ids = ids[:args.max_eval_samples]
+    eval_dataset = dataset['train'].filter(lambda example: example["id"] in val_ids)
+    dataset['train'] = dataset['train'].filter(lambda example: example["id"] not in val_ids)
+    print(len(dataset['train']), len(eval_dataset))
+    
     dataset = format_dataset(dataset, args.dataset_format)
 
     # Split train/eval, reduce size
     if args.do_eval or args.do_predict:
-        if 'eval' in dataset:
-            eval_dataset = dataset['eval']
-        else:
-            print('Splitting train dataset in train and validation according to `eval_dataset_size`')
-#            dataset = dataset["train"].train_test_split(
-#                test_size=args.eval_dataset_size, shuffle=True, seed=42
-#            )
-            ids = list(set(dataset['train']['id']))
-            import numpy as np
-            np.random.shuffle(ids)
-            val_ids = ids[:args.max_eval_samples]
-            eval_dataset = dataset['train'].filter(lambda example: example["id"] in val_ids)
-            dataset['train'] = dataset['train'].filter(lambda example: example["id"] not in val_ids)
-            print(len(dataset['train']), len(eval_dataset))
+        eval_dataset = dataset['eval']
         if args.max_eval_samples is not None and len(eval_dataset) > args.max_eval_samples:
             eval_dataset = eval_dataset.select(range(args.max_eval_samples))
         if args.group_by_length:

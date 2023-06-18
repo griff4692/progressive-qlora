@@ -514,7 +514,9 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
     def load_data(dataset_name):
         if dataset_name == 'alpaca':
             return load_dataset("tatsu-lab/alpaca")
-        elif dataset_name == 'alpaca-clean':
+        elif dataset_name == 'griffin/progressive_summarization':
+            return load_dataset(dataset_name)	
+	elif dataset_name == 'alpaca-clean':
             return load_dataset("yahma/alpaca-cleaned")
         elif dataset_name == 'chip2':
             return load_dataset("laion/OIG", data_files='unified_chip2.jsonl')
@@ -656,6 +658,7 @@ def train():
         tokenizer_type='llama' if 'llama' in args.model_name_or_path else None, # Needed for HF name change
         use_auth_token=args.use_auth_token,
     )
+    tokenizer.bos_token_id = 1
     if tokenizer._pad_token is None:
         smart_tokenizer_and_embedding_resize(
             special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),

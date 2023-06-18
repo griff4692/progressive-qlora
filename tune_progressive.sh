@@ -4,10 +4,12 @@ set -e
 export WANDB_PROJECT='compare_eval'
 export WANDB_ENTITY='griffinadams'
 
-EXPERIMENT=$1
+MODEL_SIZE=$1
+EXPERIMENT=$2
+VAL_NUM=512
+MAX_MEMORY=49000
 EVAL_STEPS=500
-MODEL_SIZE=7
-MAX_MEMORY=24576
+MAX_STEPS=10000
 
 if [[ $MODEL_SIZE -eq 7 ]]; then
   echo "Detected 7B"
@@ -21,13 +23,13 @@ else
   LEARNING_RATE=0.0001
 fi
 
-python ~/qlora/qlora.py \
+python qlora.py \
   --dataset_format self-instruct \
   --dataset griffin/progressive_summarization \
   --run_name $EXPERIMENT \
   --model_name_or_path "tiiuae/falcon-${MODEL_SIZE}b" \
   --learning_rate $LEARNING_RATE \
-  --max_eval_samples 512 \
+  --eval_dataset_size $VAL_NUM \
   --per_device_train_batch_size 1 \
   --per_device_eval_batch_size 1 \
   --source_max_len $SOURCE_MAX_LEN \
@@ -39,9 +41,10 @@ python ~/qlora/qlora.py \
   --eval_steps $EVAL_STEPS \
   --evaluation_strategy steps \
   --trust_remote_code True \
-  --max_steps 10000 \
+  --max_steps $MAX_STEPS \
   --logging_steps 2 \
   --do_train \
   --do_eval \
-  --output_dir $HOME/qlora_weights/$EXPERIMENT \
+  --bf16 \
+  --output_dir $HOME/falcon_weights/$EXPERIMENT \
 #  --train_on_source False \

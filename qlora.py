@@ -516,7 +516,7 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
             return load_dataset("tatsu-lab/alpaca")
         elif dataset_name == 'griffin/progressive_summarization':
             return load_dataset(dataset_name)	
-	elif dataset_name == 'alpaca-clean':
+        elif dataset_name == 'alpaca-clean':
             return load_dataset("yahma/alpaca-cleaned")
         elif dataset_name == 'chip2':
             return load_dataset("laion/OIG", data_files='unified_chip2.jsonl')
@@ -584,10 +584,16 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
             eval_dataset = dataset['eval']
         else:
             print('Splitting train dataset in train and validation according to `eval_dataset_size`')
-            dataset = dataset["train"].train_test_split(
-                test_size=args.eval_dataset_size, shuffle=True, seed=42
-            )
-            eval_dataset = dataset['test']
+#            dataset = dataset["train"].train_test_split(
+#                test_size=args.eval_dataset_size, shuffle=True, seed=42
+#            )
+            ids = list(set(dataset['train']['id']))
+            import numpy as np
+            np.random.shuffle(ids)
+            val_ids = ids[:args.max_eval_samples]
+            eval_dataset = dataset['train'].filter(lambda example: example["id"] in val_ids)
+            dataset['train'] = dataset['train'].filter(lambda example: example["id"] not in val_ids)
+            print(len(dataset['train']), len(eval_dataset))
         if args.max_eval_samples is not None and len(eval_dataset) > args.max_eval_samples:
             eval_dataset = eval_dataset.select(range(args.max_eval_samples))
         if args.group_by_length:

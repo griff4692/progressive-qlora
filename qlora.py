@@ -581,7 +581,8 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
     import numpy as np
     np.random.seed(1992)
     np.random.shuffle(ids)
-    val_ids = set(ids[:args.max_eval_samples])
+    val_ids = set(ids[:args.eval_dataset_size])
+    assert args.eval_dataset_size < len(ids)
     dataset['eval'] = dataset['train'].filter(lambda example: example["id"] in val_ids)
     dataset['train'] = dataset['train'].filter(lambda example: example["id"] not in val_ids)
     print('train ', len(dataset['train']), '\nvalidation ', len(dataset['eval']))

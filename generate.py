@@ -1,16 +1,11 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections import defaultdict
-import copy
-import json
 import os
-from os.path import exists, join, isdir
+from os.path import join, isdir
 from dataclasses import dataclass, field
-import sys
 from typing import Optional, Dict, Sequence
 import numpy as np
-from tqdm import tqdm
 import logging
 import bitsandbytes as bnb
 import pandas as pd
@@ -22,23 +17,16 @@ import argparse
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    set_seed,
     Seq2SeqTrainer,
     BitsAndBytesConfig,
-    LlamaTokenizer
 )
-from datasets import load_dataset, Dataset
-import evaluate
+from datasets import load_dataset
 
 from peft import (
     prepare_model_for_kbit_training,
-    LoraConfig,
-    get_peft_model,
     PeftModel
 )
 from peft.tuners.lora import LoraLayer
-from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -46,13 +34,22 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PAD_TOKEN = "[PAD]"
 
+# TODO Change these if they change
+INSTRUCTIONS = {
+    'rank': 'Rank Summaries of an Article from best to worst.',
+    'cot': 'Generate a progressively longer summary of the Article.',
+    'vanilla': 'Generate a concise and informative summary of the Article.',
+    'control_length': 'Generate a summary of the Article with a target length.',
+    'change_length': 'Shorten or lengthen a Summary of an Article.'
+}
+
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(
         default="EleutherAI/pythia-12b"
     )
     trust_remote_code: Optional[bool] = field(
-        default=False,
+        default=True,
         metadata={"help": "Enable unpickling of arbitrary code in AutoModelForCausalLM#from_pretrained."}
     )
     use_auth_token: Optional[bool] = field(
@@ -83,27 +80,11 @@ class DataArguments:
         default=1024,
         metadata={"help": "Maximum source sequence length. Sequences will be right padded (and possibly truncated)."},
     )
-    target_max_len: int = field(
-        default=256,
-        metadata={"help": "Maximum target sequence length. Sequences will be right padded (and possibly truncated)."},
-    )
-    dataset: str = field(
-        default='alpaca',
-        metadata={"help": "Which dataset to finetune on. See datamodule for options."}
-    )
-    dataset_format: Optional[str] = field(
-        default=None,
-        metadata={"help": "Which dataset format is used. [alpaca|chip2|self-instruct|hh-rlhf]"}
-    )
 
 @dataclass
 class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     cache_dir: Optional[str] = field(
         default=None
-    )
-    train_on_source: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Whether to train on the input in addition to the target text."}
     )
     adam8bit: bool = field(
         default=False,
@@ -134,27 +115,13 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
         metadata={"help":"Lora dropout."}
     )
     max_memory_MB: int = field(
-        default=80000,
+        default=4800,
         metadata={"help": "Free memory per gpu."}
     )
     output_dir: str = field(default='./output', metadata={"help": 'The output dir for logs and checkpoints'})
     optim: str = field(default='paged_adamw_32bit', metadata={"help": 'The optimizer to be used'})
-    per_device_train_batch_size: int = field(default=1, metadata={"help": 'The training batch size per GPU. Increase for better speed.'})
-    gradient_accumulation_steps: int = field(default=16, metadata={"help": 'How many gradients to accumulate before to perform an optimizer step'})
-    max_steps: int = field(default=10000, metadata={"help": 'How many optimizer update steps to take'})
-    weight_decay: float = field(default=0.0, metadata={"help": 'The L2 weight decay rate of AdamW'}) # use lora dropout instead for regularization if needed
-    learning_rate: float = field(default=0.0002, metadata={"help": 'The learnign rate'})
-    remove_unused_columns: bool = field(default=False, metadata={"help": 'Removed unused columns. Needed to make this codebase work.'})
-    max_grad_norm: float = field(default=0.3, metadata={"help": 'Gradient clipping max norm. This is tuned and works well for all models tested.'})
     gradient_checkpointing: bool = field(default=True, metadata={"help": 'Use gradient checkpointing. You want to use this.'})
-    do_train: bool = field(default=True, metadata={"help": 'To train or not to train, that is the question?'})
-    lr_scheduler_type: str = field(default='constant', metadata={"help": 'Learning rate schedule. Constant a bit better than cosine, and has advantage for analysis'})
-    warmup_ratio: float = field(default=0.03, metadata={"help": 'Fraction of steps to do a warmup for'})
-    logging_steps: int = field(default=10, metadata={"help": 'The frequency of update steps after which to log the loss'})
-    group_by_length: bool = field(default=True, metadata={"help": 'Group sequences into batches with same length. Saves memory and speeds up training considerably.'})
-    save_strategy: str = field(default='steps', metadata={"help": 'When to save checkpoints'})
-    save_steps: int = field(default=250, metadata={"help": 'How often to save a model'})
-    save_total_limit: int = field(default=40, metadata={"help": 'How many checkpoints to save before the oldest is overwritten'})
+
 
 @dataclass
 class GenerationArguments:
@@ -162,7 +129,7 @@ class GenerationArguments:
     # https://huggingface.co/docs/transformers/main_classes/text_generation#transformers.GenerationConfig
     # Length arguments
     max_new_tokens: Optional[int] = field(
-        default=256,
+        default=512,
         metadata={"help": "Maximum number of new tokens to be generated in evaluation or prediction loops"
                           "if predict_with_generate is set."}
     )
@@ -188,6 +155,7 @@ class GenerationArguments:
     length_penalty: Optional[float] = field(default=1.0)
     no_repeat_ngram_size: Optional[int] = field(default=0)
 
+
 def find_all_linear_names(args, model):
     cls = bnb.nn.Linear4bit if args.bits == 4 else (bnb.nn.Linear8bitLt if args.bits == 8 else torch.nn.Linear)
     lora_module_names = set()
@@ -196,38 +164,10 @@ def find_all_linear_names(args, model):
             names = name.split('.')
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
 
-
-    if 'lm_head' in lora_module_names: # needed for 16-bit
+    if 'lm_head' in lora_module_names:  # needed for 16-bit
         lora_module_names.remove('lm_head')
     return list(lora_module_names)
 
-
-class SavePeftModelCallback(transformers.TrainerCallback):
-    def save_model(self, args, state, kwargs):
-        print('Saving PEFT checkpoint...')
-        if state.best_model_checkpoint is not None:
-            checkpoint_folder = os.path.join(state.best_model_checkpoint, "adapter_model")
-        else:
-            checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
-
-        peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
-        kwargs["model"].save_pretrained(peft_model_path)
-
-        pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
-        if os.path.exists(pytorch_model_path):
-            os.remove(pytorch_model_path)
-
-    def on_save(self, args, state, control, **kwargs):
-        self.save_model(args, state, kwargs)
-        return control
-
-    def on_train_end(self, args, state, control, **kwargs):
-        def touch(fname, times=None):
-            with open(fname, 'a'):
-                os.utime(fname, times)
-
-        touch(join(args.output_dir, 'completed'))
-        self.save_model(args, state, kwargs)
 
 def get_accelerate_model(args, checkpoint_dir):
 
@@ -241,9 +181,6 @@ def get_accelerate_model(args, checkpoint_dir):
         local_rank = int(os.environ.get('LOCAL_RANK', '0'))
         device_map = {'': local_rank}
         max_memory = {'': max_memory[local_rank]}
-
-
-    if args.full_finetune: assert args.bits in [16, 32]
 
     print(f'loading base model {args.model_name_or_path}...')
     compute_dtype = (torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
@@ -278,28 +215,13 @@ def get_accelerate_model(args, checkpoint_dir):
     setattr(model, 'is_parallelizable', True)
 
     model.config.torch_dtype=(torch.float32 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32))
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
 
-    if not args.full_finetune:
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=args.gradient_checkpointing)
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
-    if not args.full_finetune:
-        if checkpoint_dir is not None:
-            print("Loading adapters from checkpoint.")
-            model = PeftModel.from_pretrained(model, join(checkpoint_dir, 'adapter_model'), is_trainable=True)
-        else:
-            print(f'adding LoRA modules...')
-            modules = find_all_linear_names(args, model)
-            config = LoraConfig(
-                r=args.lora_r,
-                lora_alpha=args.lora_alpha,
-                target_modules=modules,
-                lora_dropout=args.lora_dropout,
-                bias="none",
-                task_type="CAUSAL_LM",
-            )
-            model = get_peft_model(model, config)
+    print("Loading adapters from checkpoint.")
+    model = PeftModel.from_pretrained(model, join(checkpoint_dir, 'adapter_model'), is_trainable=True)
 
     for name, module in model.named_modules():
         if isinstance(module, LoraLayer):
@@ -313,22 +235,6 @@ def get_accelerate_model(args, checkpoint_dir):
                     module = module.to(torch.bfloat16)
     return model
 
-def print_trainable_parameters(args, model):
-    """
-    Prints the number of trainable parameters in the model.
-    """
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-    if args.bits == 4: trainable_params /= 2
-    print(
-        f"trainable params: {trainable_params} || "
-        f"all params: {all_param} || "
-        f"trainable: {100 * trainable_params / all_param}"
-    )
 
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
@@ -356,14 +262,10 @@ def smart_tokenizer_and_embedding_resize(
 class DataCollatorForCausalLM(object):
     tokenizer: transformers.PreTrainedTokenizer
     source_max_len: int
-    target_max_len: int
-    train_on_source: bool
-    predict_with_generate: bool
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         # Extract elements
         sources = [f"{self.tokenizer.bos_token}{example['input']}" for example in instances]
-        targets = [f"{example['output']}{self.tokenizer.eos_token}" for example in instances]
         # Tokenize
         tokenized_sources_with_prompt = self.tokenizer(
             sources,
@@ -371,18 +273,10 @@ class DataCollatorForCausalLM(object):
             truncation=True,
             add_special_tokens=False,
         )
-        tokenized_targets = self.tokenizer(
-            targets,
-            max_length=self.target_max_len,
-            truncation=True,
-            add_special_tokens=False,
-        )
+
         # Build the input and labels for causal LM
         input_ids = []
-        for tokenized_source, tokenized_target in zip(
-            tokenized_sources_with_prompt['input_ids'],
-            tokenized_targets['input_ids']
-        ):
+        for tokenized_source in tokenized_sources_with_prompt['input_ids']:
             input_ids.append(torch.tensor(tokenized_source))
         # Apply padding
         input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
@@ -394,35 +288,31 @@ class DataCollatorForCausalLM(object):
         return data_dict
 
 
-def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
+def make_data_module(args):
     dataset = load_dataset('cnn_dailymail', version='3.0.0', split='test')
     n = len(dataset)
     idxs = np.arange(n)
+    np.random.seed(1992)
     np.random.shuffle(idxs)
-    idxs = list(sorted(idxs[:max_eval_samples]))
+    idxs = list(sorted(idxs[:args.max_eval_samples]))
     dataset = dataset.select(idxs)
-    dataset = format_dataset(dataset, args.dataset_format)
 
-    for old, new in [["prompt", "input"], ["completion", "output"]]:
-        dataset = dataset.rename_column(old, new)
-    # Remove unused columns.
-    dataset = dataset.remove_columns(
-        [col for col in dataset.column_names['train'] if col not in ['input', 'output']]
-    )
+    dataset_ids = dataset['id']
 
-    data_collator = DataCollatorForCausalLM(
-        tokenizer=tokenizer,
-        source_max_len=args.source_max_len,
-        target_max_len=args.target_max_len,
-        train_on_source=False,
-        predict_with_generate=True,
-    )
-    return dict(
-        train_dataset=None,
-        eval_dataset=None,
-        predict_dataset=dataset,
-        data_collator=data_collator
-    )
+    if os.environ['SUMMARIZATION_TASK'] == 'vanilla':
+        dataset = dataset.map(
+            lambda example: {'input': INSTRUCTIONS['vanilla'] + '\n\n' + f'Article: {example["article"]}\n\n'},
+            remove_columns=['article', 'highlights', 'id']
+        )
+    elif os.environ['SUMMARIZATION_TASK'] == 'cot':
+        dataset = dataset.map(
+            lambda example: {'input': INSTRUCTIONS['cot'] + '\n\n' + f'Article: {example["article"]}\n\n'},
+            remove_columns=['article', 'highlights', 'id']
+        )
+    else:
+        raise Exception('unrecognized ', os.environ['SUMMARIZATION_TASK'])
+
+    return dataset, dataset_ids
 
 
 def get_last_checkpoint(checkpoint_dir):
@@ -432,27 +322,30 @@ def get_last_checkpoint(checkpoint_dir):
             max_step = max(max_step, int(filename.replace('checkpoint-', '')))
     checkpoint_dir = join(checkpoint_dir, f'checkpoint-{max_step}')
     print(f"Found a previous checkpoint at: {checkpoint_dir}")
-    return checkpoint_dir, is_completed # checkpoint found!
+    return checkpoint_dir
 
 
-def train():
+def inference():
     hfparser = transformers.HfArgumentParser((
         ModelArguments, DataArguments, TrainingArguments, GenerationArguments
     ))
     model_args, data_args, training_args, generation_args, extra_args = \
         hfparser.parse_args_into_dataclasses(return_remaining_strings=True)
     training_args.generation_config = transformers.GenerationConfig(**vars(generation_args))
+
+    print(training_args.generation_config)
+
     args = argparse.Namespace(
         **vars(model_args), **vars(data_args), **vars(training_args)
     )
+
+    predict_dataset, dataset_ids = make_data_module(args=args)
 
     checkpoint_dir = get_last_checkpoint(args.output_dir)
     model = get_accelerate_model(args, checkpoint_dir)
 
     model.config.use_cache = False
-    print_trainable_parameters(args, model)
     print('loaded model')
-    set_seed(args.seed)
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
@@ -460,7 +353,7 @@ def train():
         cache_dir=args.cache_dir,
         padding_side="right",
         use_fast=False, # Fast tokenizer giving issues.
-        tokenizer_type='llama' if 'llama' in args.model_name_or_path else None, # Needed for HF name change
+        tokenizer_type='llama' if 'llama' in args.model_name_or_path else None,  # Needed for HF name change
         use_auth_token=args.use_auth_token,
     )
     tokenizer.bos_token_id = 1
@@ -471,48 +364,43 @@ def train():
             model=model,
         )
 
-    data_module = make_data_module(tokenizer=tokenizer, args=args)
+    data_collator = DataCollatorForCausalLM(
+        tokenizer=tokenizer,
+        source_max_len=args.source_max_len,
+    )
     trainer = Seq2SeqTrainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
-        **{k:v for k,v in data_module.items() if k != 'predict_dataset'},
+        data_collator=data_collator
     )
-
-    # Verifying the datatypes.
-    dtypes = {}
-    for _, p in model.named_parameters():
-        dtype = p.dtype
-        if dtype not in dtypes: dtypes[dtype] = 0
-        dtypes[dtype] += p.numel()
-    total = 0
-    for k, v in dtypes.items(): total+= v
-    for k, v in dtypes.items():
-        print(k, v, v/total)
 
     # Prediction
     logger.info("*** Predict ***")
-    prediction_output = trainer.predict(
-        test_dataset=data_module['predict_dataset'], metric_key_prefix="predict"
-    )
-    prediction_metrics = prediction_output.metrics
-    predictions = prediction_output.predictions
-    predictions = np.where(predictions != -100, predictions, tokenizer.pad_token_id)
-    predictions = tokenizer.batch_decode(
-        predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
-    )
-    with open(os.path.join(args.output_dir, 'predictions.jsonl'), 'w') as fout:
-        for i, example in enumerate(data_module['predict_dataset']):
-            example['prediction_with_input'] = predictions[i].strip()
-            example['prediction'] = predictions[i].replace(example['input'], '').strip()
-            fout.write(json.dumps(example) + '\n')
-    print(prediction_metrics)
-    trainer.log_metrics("predict", prediction_metrics)
-    trainer.save_metrics("predict", prediction_metrics)
-    all_metrics.update(prediction_metrics)
+    trainer.args.remove_unused_columns = False
+    prediction_output = trainer.predict(test_dataset=predict_dataset)
 
-    with open(os.path.join(args.output_dir, "metrics.json"), "w") as fout:
-        fout.write(json.dumps(all_metrics))
+    pred_ids = prediction_output.predictions
+    predictions = []
+    for pred_id in pred_ids.tolist():
+        try:
+            pred = tokenizer.decode(
+                pred_id, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            )
+            predictions.append(pred)
+        except:
+            predictions.append(None)
+            print('Invalid predicted tokens...how is this possible?')
+            print(pred_id)
+
+    out_fn = os.path.join(args.output_dir, os.environ['SUMMARIZATION_TASK'] + '.csv')
+    output_df = pd.DataFrame({
+        'id': dataset_ids,
+        'prediction': predictions
+    })
+    print(f'Saving to {out_fn}')
+    print(predictions)
+    output_df.to_csv(out_fn, index=False)
 
 
 if __name__ == "__main__":

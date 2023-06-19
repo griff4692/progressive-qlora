@@ -515,7 +515,11 @@ def make_data_module(tokenizer: transformers.PreTrainedTokenizer, args) -> Dict:
         if dataset_name == 'alpaca':
             return load_dataset("tatsu-lab/alpaca")
         elif dataset_name == 'griffin/progressive_summarization':
-            return load_dataset(dataset_name)	
+            dataset = load_dataset(dataset_name)
+            if os.environ['SUMMARIZATION_TASK'] != 'all':
+                dataset = dataset.filter(lambda example: example['task'] == os.environ['SUMMARIZATION_TASK'])
+            assert len(dataset) > 0
+            return dataset
         elif dataset_name == 'alpaca-clean':
             return load_dataset("yahma/alpaca-cleaned")
         elif dataset_name == 'chip2':
@@ -630,6 +634,7 @@ def get_last_checkpoint(checkpoint_dir):
         print(f"Found a previous checkpoint at: {checkpoint_dir}")
         return checkpoint_dir, is_completed # checkpoint found!
     return None, False # first training
+
 
 def train():
     hfparser = transformers.HfArgumentParser((
@@ -809,6 +814,7 @@ def train():
     if (args.do_train or args.do_eval or args.do_predict):
         with open(os.path.join(args.output_dir, "metrics.json"), "w") as fout:
             fout.write(json.dumps(all_metrics))
+
 
 if __name__ == "__main__":
     train()
